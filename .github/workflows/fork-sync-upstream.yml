@@ -1,0 +1,70 @@
+name: Sync upstream main
+
+on:
+  schedule:
+    # Daily at 03:17 Asia/Shanghai (UTC+8).
+    - cron: '17 19 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: fork-sync-upstream-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'teacat99/rea'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SYNC_WORKFLOW_PATH: .github/workflows/fork-sync-upstream.yml
+    steps:
+      - name: Disable inherited build and release workflows
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/workflows" \
+            --jq '.workflows[] | select(.state == "active") | [.id, .path] | @tsv' > "$RUNNER_TEMP/active-workflows.tsv"
+          while IFS=$'\t' read -r workflow_id workflow_path; do
+            if [[ "$workflow_path" != "$SYNC_WORKFLOW_PATH" ]]; then
+              gh api --method PUT "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow_id/disable"
+              printf 'Disabled: %s\n' "$workflow_path"
+            fi
+          done < "$RUNNER_TEMP/active-workflows.tsv"
+
+      - name: Merge upstream main without discarding fork commits
+        shell: bash
+        run: |
+          set -euo pipefail
+          parent=$(gh api "repos/$GITHUB_REPOSITORY" --jq '.parent.full_name')
+          [[ "$parent" == 'morluto/rea' ]] || { echo 'Unexpected upstream repository'; exit 1; }
+          upstream_sha=$(gh api repos/morluto/rea/git/ref/heads/main --jq '.object.sha')
+          printf 'SYNC_UPSTREAM_SHA=%s\n' "$upstream_sha" >> "$GITHUB_ENV"
+          gh api --method POST "repos/$GITHUB_REPOSITORY/merge-upstream" \
+            -f branch=main --jq '.message' | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify upstream history is included
+        shell: bash
+        run: |
+          set -euo pipefail
+          behind=$(gh api "repos/$GITHUB_REPOSITORY/compare/$SYNC_UPSTREAM_SHA...main" --jq '.behind_by')
+          [[ "$behind" == '0' ]] || { echo "Backup is missing $behind upstream commits"; exit 1; }
+          printf '\nVerified upstream commit: `%s`\n' "$SYNC_UPSTREAM_SHA" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Disable any newly imported workflows
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/workflows" \
+            --jq '.workflows[] | select(.state == "active") | [.id, .path] | @tsv' > "$RUNNER_TEMP/active-workflows-after.tsv"
+          while IFS=$'\t' read -r workflow_id workflow_path; do
+            if [[ "$workflow_path" != "$SYNC_WORKFLOW_PATH" ]]; then
+              gh api --method PUT "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow_id/disable"
+              printf 'Disabled: %s\n' "$workflow_path"
+            fi
+          done < "$RUNNER_TEMP/active-workflows-after.tsv"
